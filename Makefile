@@ -9,6 +9,9 @@ gclog: $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS)
 #	which upx >/dev/null 2>&1 && upx -9 -qq $@ || true
 
+gclog-debug:
+	CFLAGS="$(CFLAGS) -g" $(MAKE) gclog
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
 
