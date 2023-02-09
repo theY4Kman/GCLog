@@ -33,6 +33,8 @@ typedef struct {
 	Geiger device_type;
 	char *device_port;
 	speed_t device_baudrate;
+	unsigned int device_conn_attempts;
+	int device_reconnect_after_errors;
 	float latitude, longitude;
 	char *location;
 	char *netc_id;
@@ -138,6 +140,24 @@ int geiger_get_cpm(Geiger type, int device) {
 	return 0;
 }
 
+int geiger_open_from_cfg(Settings *cfg) {
+	int fd;
+	char *msg;
+
+	for (unsigned int i = 0; i < cfg->device_conn_attempts; i++) {
+		if ((fd = geiger_open(cfg->device_type, cfg->device_port, cfg->device_baudrate)) != -1)
+			return fd;
+
+		asprintf(&msg, "Connection attempt [%d/%d] to Geiger counter failed.", i + 1, cfg->device_conn_attempts);
+		log_debug(msg);
+
+		sleep(1);
+	}
+
+	perror("FATAL ERROR: Could not access Geiger counter");
+	return -1;
+}
+
 bool send_gmcmap(const char *user, const char *device, int cpm) {
 	char *req;
 	int sock;
@@ -234,8 +254,10 @@ void init_settings(Settings *s) {
 	s->device_type = SIM;
 	s->device_port = NULL;
 	s->device_baudrate = B0;
-	s->latitude = 0.0;
-	s->longitude = 0.0;
+	s->device_conn_attempts = 3;
+	s->device_reconnect_after_errors = 0;
+	s->latitude = 0.0f;
+	s->longitude = 0.0f;
 	s->location = NULL;
 	s->netc_id = NULL;
 	s->radmon_user = NULL;
@@ -301,6 +323,10 @@ int main(int argc, char *argv[]) {
 					cfg.device_port = string_copy(val);
 				if ((val = map_get(ini, "device.baudrate")) != NULL)
 					cfg.device_baudrate = baud_rate(atoi(val));
+				if ((val = map_get(ini, "device.conn_attempts")) != NULL)
+					cfg.device_conn_attempts = MAX(atoi(val), 1);
+				if ((val = map_get(ini, "device.reconnect_after_errors")) != NULL)
+					cfg.device_reconnect_after_errors = atoi(val);
 				if ((val = map_get(ini, "latitude")) != NULL)
 					cfg.latitude = MIN(MAX(atof(val), -90.0), 90.0);
 				if ((val = map_get(ini, "longitude")) != NULL)
@@ -330,13 +356,29 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (verbose)
-		printf("Configuration:\n\t\t%s on %s @ %#07o,\n\t\tLocation: %s (%.4f, %.4f)\n\t\tnetc.com: %s,\n\t\tradmon.org: %s / %s,\n\t\tsafecast.org: %s / Device ID %u,\n\t\tgmcmap.com: %s / Device ID %s,\n\t\t%us interval\n\n", GeigerNames[cfg.device_type], cfg.device_port, cfg.device_baudrate, cfg.location, cfg.latitude, cfg.longitude, cfg.netc_id, cfg.radmon_user, cfg.radmon_pass, cfg.safecast_key, cfg.safecast_device, cfg.gmcmap_user, cfg.gmcmap_device, cfg.interval);
+		printf(
+			"Configuration:\n"
+			"\t\t%s on %s @ %#07o,\n"
+			"\t\tLocation: %s (%.4f, %.4f)\n"
+			"\t\tnetc.com: %s,\n"
+			"\t\tradmon.org: %s / %s,\n"
+			"\t\tsafecast.org: %s / Device ID %u,\n"
+			"\t\tgmcmap.com: %s / Device ID %s,\n"
+			"\t\t%us interval\n"
+			"\n",
+			GeigerNames[cfg.device_type], cfg.device_port, cfg.device_baudrate,
+			cfg.location, cfg.latitude, cfg.longitude,
+			cfg.netc_id,
+			cfg.radmon_user, cfg.radmon_pass,
+			cfg.safecast_key, cfg.safecast_device,
+			cfg.gmcmap_user, cfg.gmcmap_device,
+			cfg.interval
+		);
 
 	/* Initializing device communication */
 	int fd = -1;
 
-	if ((fd = geiger_open(cfg.device_type, cfg.device_port, cfg.device_baudrate)) == -1) {
-		perror("FATAL ERROR: Could not access Geiger counter");
+	if ((fd = geiger_open_from_cfg(&cfg)) == -1) {
 		free_settings(&cfg);
 		exit(EXIT_FAILURE);
 	}
@@ -377,7 +419,7 @@ int main(int argc, char *argv[]) {
 
 	/* Main loop */
 	time_t last = time(NULL);
-	int cpm, sum = 0, count = 0;
+	int cpm, sum = 0, count = 0, error_count = 0;
 
 	log_open("gclog");
 
@@ -388,6 +430,19 @@ int main(int argc, char *argv[]) {
 		if ((cpm = geiger_get_cpm(cfg.device_type, fd)) > 0) {
 			sum += cpm;
 			count++;
+			error_count = 0;
+		} else {
+			error_count++;
+
+			if (cfg.device_reconnect_after_errors > 0 && error_count > cfg.device_reconnect_after_errors) {
+				log_inform("Encountered multiple ZERO values. Attempting to reestablish connection.");
+				geiger_close(cfg.device_type, fd);
+				if ((fd = geiger_open_from_cfg(&cfg)) == -1) {
+					free_settings(&cfg);
+					exit(EXIT_FAILURE);
+				}
+				log_inform("Successfully reestablished connection to Geiger counter");
+			}
 		}
 
 		if (difftime(time(NULL), last) >= cfg.interval) {
