@@ -280,7 +280,8 @@ void free_settings(Settings *s) {
 }
 
 int main(int argc, char *argv[]) {
-	bool verbose = false, debug = false;
+	bool debug = false;
+	int verbose = 0;
 	Settings cfg;
 
 	init_settings(&cfg);
@@ -299,7 +300,14 @@ int main(int argc, char *argv[]) {
 				break;
 
 			case 'v':
-				verbose = true;
+				verbose++;
+				break;
+
+			case 'q':
+				verbose--;
+				if (verbose < 0) {
+					verbose = 0;
+				}
 				break;
 
 			case 'd':
@@ -418,7 +426,7 @@ int main(int argc, char *argv[]) {
 	signal(SIGHUP, signal_handler);
 
 	/* Main loop */
-	time_t last = time(NULL);
+	time_t last = time(NULL), inst = time(NULL);
 	int cpm, sum = 0, count = 0, error_count = 0;
 
 	log_open("gclog");
@@ -431,6 +439,16 @@ int main(int argc, char *argv[]) {
 			sum += cpm;
 			count++;
 			error_count = 0;
+
+			if (verbose > 1) {
+				time(&inst);
+				struct tm *tm = gmtime(&inst);
+
+				char *cpmstr;
+				asprintf(&cpmstr, "Instant CPM: %d, Timestamp: %s", cpm, asctime(tm));
+				log_inform(cpmstr);
+				free(cpmstr);
+			}
 		} else {
 			error_count++;
 
