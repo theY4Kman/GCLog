@@ -6,18 +6,17 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include "gclog.h"
 #include "logger.h"
 #include "ini.h"
 #include "diygeiger.h"
 #include "gqgeiger.h"
-#include "tcpcli.h"
+#include "upload.h"
 
 #define GCLOG_VERSION	"0.2.5"
 #define GCLOG_BUILD	"2019-04-22"
-#define BUF_SIZE	1000
 #ifndef MIN
 #define MIN(a,b)	((a)<(b)?(a):(b))
 #endif
@@ -25,24 +24,7 @@
 #define MAX(a,b)	((a)>(b)?(a):(b))
 #endif
 
-typedef enum { SIM, DIY, GQ } Geiger;
 static const char *GeigerNames[] = { "Geiger simulator", "DIY/MyGeiger/NET-IO Geiger Kit", "GQ GMC Geiger Counter" };
-
-typedef struct {
-	unsigned int interval;
-	Geiger device_type;
-	char *device_port;
-	speed_t device_baudrate;
-	unsigned int device_conn_attempts;
-	int device_reconnect_after_errors;
-	float latitude, longitude;
-	char *location;
-	char *netc_id;
-	char *radmon_user, *radmon_pass;
-	char *safecast_key;
-	unsigned int safecast_device;
-	char *gmcmap_user, *gmcmap_device;
-} Settings;
 
 static volatile bool Running = true;
 
@@ -55,10 +37,6 @@ char * string_copy(const char *src) {
 	strcpy(dst, src);
 
 	return dst;
-}
-
-bool string_isset(char *str) {
-	return str != NULL && strlen(str) > 0;
 }
 
 void try_free(char *buf) {
@@ -158,82 +136,6 @@ int geiger_open_from_cfg(Settings *cfg) {
 	return -1;
 }
 
-bool send_gmcmap(const char *user, const char *device, int cpm) {
-	char *req;
-	int sock;
-	char buf[BUF_SIZE] = { 0 };
-
-	asprintf(&req, "GET /log2.asp?AID=%s&GID=%s&CPM=%d HTTP/1.1\r\nHost: www.gmcmap.com\r\n\r\n", user, device, cpm);
-
-	if ((sock = tcp_connect("www.gmcmap.com", "80")) != -1) {
-		tcp_send(sock, req);
-		tcp_receive(sock, buf, BUF_SIZE);
-		tcp_close(sock);
-	}
-
-	free(req);
-
-	return sock != -1 && strstr(buf, "OK.") != NULL;
-}
-
-bool send_netc(const char *id, int cpm) {
-	char *req;
-	int sock;
-	char buf[BUF_SIZE] = { 0 };
-
-	asprintf(&req, "GET /push.php?id=%s&v=w32_1.1.3.1085&c=%d HTTP/1.1\r\nHost: radiation.netc.com\r\n\r\n", id, cpm);
-
-	if ((sock = tcp_connect("radiation.netc.com", "80")) != -1) {
-		tcp_send(sock, req);
-		tcp_receive(sock, buf, BUF_SIZE);
-		tcp_close(sock);
-	}
-
-	free(req);
-
-	return sock != -1 && strstr(buf, "Ok.") != NULL;
-}
-
-bool send_radmon(const char *user, const char *pass, int cpm, const struct tm *tm) {
-	char ch[22], *req;
-	int sock;
-	char buf[BUF_SIZE] = { 0 };
-
-	strftime(ch, 22, "%Y-%m-%d%%20%H:%M:%S", tm);
-	asprintf(&req, "GET /radmon.php?user=%s&password=%s&function=submit&datetime=%s&value=%d&unit=CPM HTTP/1.1\r\nHost: www.radmon.org\r\n\r\n", user, pass, ch, cpm);
-
-	if ((sock = tcp_connect("www.radmon.org", "80")) != -1) {
-		tcp_send(sock, req);
-		tcp_receive(sock, buf, BUF_SIZE);
-		tcp_close(sock);
-	}
-
-	free(req);
-
-	return sock != -1 && strstr(buf, "Incorrect login.") == NULL;
-}
-
-bool send_safecast(const char *key, unsigned int dev, int cpm, const struct tm *tm, float lat, float lng, const char *loc) {
-	char ch[21], *pld, *req;
-	int sock;
-	char buf[BUF_SIZE] = { 0 };
-
-	strftime(ch, 21, "%Y-%m-%dT%H:%M:%SZ", tm);
-	asprintf(&pld, "{\"latitude\":\"%.4f\",\"longitude\":\"%.4f\",\"location_name\":\"%s\",\"device_id\":\"%u\",\"captured_at\":\"%s\",\"value\":\"%d\",\"unit\":\"cpm\"}", lat, lng, loc, dev, ch, cpm);
-	asprintf(&req, "POST /measurements.json?api_key=%s HTTP/1.1\r\nHost: api.safecast.org\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s", key, strlen(pld), pld);
-
-	if ((sock = tcp_connect("api.safecast.org", "80")) != -1) {
-		tcp_send(sock, req);
-		tcp_receive(sock, buf, BUF_SIZE);
-		tcp_close(sock);
-	}
-
-	free(pld);
-	free(req);
-
-	return sock != -1 && strstr(buf, "201 Created") != NULL;
-}
-
 void print_usage() {
 	printf("   ___    Geiger Counter LOGger daemon\n");
 	printf("   \\_/    Version %s (Build %s)\n", GCLOG_VERSION, GCLOG_BUILD);
@@ -258,6 +160,7 @@ void init_settings(Settings *s) {
 	s->device_reconnect_after_errors = 0;
 	s->latitude = 0.0f;
 	s->longitude = 0.0f;
+	s->upload_timeout = 1;
 	s->location = NULL;
 	s->netc_id = NULL;
 	s->radmon_user = NULL;
@@ -341,6 +244,8 @@ int main(int argc, char *argv[]) {
 					cfg.longitude = MIN(MAX(atof(val), -180.0), 180.0);
 				if ((val = map_get(ini, "location")) != NULL)
 					cfg.location = string_copy(val);
+				if ((val = map_get(ini, "upload_timeout")) != NULL)
+					cfg.upload_timeout = atoi(val);
 				if ((val = map_get(ini, "netc.id")) != NULL)
 					cfg.netc_id = string_copy(val);
 				if ((val = map_get(ini, "radmon.user")) != NULL)
@@ -475,18 +380,7 @@ int main(int argc, char *argv[]) {
 					free(cpmstr);
 				}
 
-				if (string_isset(cfg.netc_id))
-					if(!send_netc(cfg.netc_id, cpm))
-						log_warn("Upload to netc.com failed.");
-				if (string_isset(cfg.radmon_user) && string_isset(cfg.radmon_pass))
-					if (!send_radmon(cfg.radmon_user, cfg.radmon_pass, cpm, tm))
-						log_warn("Upload to radmon.org failed.");
-				if (string_isset(cfg.safecast_key) && string_isset(cfg.location))
-					if(!send_safecast(cfg.safecast_key, cfg.safecast_device, cpm, tm, cfg.latitude, cfg.longitude, cfg.location))
-						log_warn("Upload to safecast.org failed.");
-				if (string_isset(cfg.gmcmap_user) && string_isset(cfg.gmcmap_device))
-					if(!send_gmcmap(cfg.gmcmap_user, cfg.gmcmap_device, cpm))
-						log_warn("Upload to gmcmap.com failed.");
+                upload_threaded(&cfg, cpm, *tm);
 
 				time(&last);
 				sum = count = 0;

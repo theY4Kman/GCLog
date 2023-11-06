@@ -1,4 +1,4 @@
-OBJECTS = trim.o map.o logger.o ini.o tcpcli.o diygeiger.o gqgeiger.o gclog.o
+OBJECTS = trim.o map.o logger.o ini.o tcpcli.o diygeiger.o gqgeiger.o gclog.o upload.o
 CFLAGS += -Wall -Wextra -Os
 #LDFLAGS += 
 PREFIX ?= /usr
